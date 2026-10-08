@@ -1,5 +1,6 @@
 import {
   ItemView,
+  TFile,
   MarkdownRenderer,
   Notice,
   WorkspaceLeaf,
@@ -7,9 +8,27 @@ import {
 } from "obsidian";
 import type ClaudeCodeSkillsPlugin from "./main";
 import type { Skill } from "./types";
-import { runWithSkillStreaming } from "./executor";
+import { runWithSkillStreaming, type TurnStats } from "./executor";
+import {
+  type Attachment,
+  attachmentsPreamble,
+  buildCard,
+  kindOf,
+  resolveVaultPath,
+} from "./attachments";
 
 export const CLAUDE_PANEL_VIEW_TYPE = "claude-skills-chat";
+
+/**
+ * Sent once at the start of a session. Claude Code reads files by line number
+ * and will happily answer "see line 153", which is no use in Obsidian: the
+ * reader sees rendered prose with no line numbers and nothing to click.
+ */
+const CITING_PLACES =
+  "How to point me at somewhere in my vault: give a link I can click, " +
+  "[[Note name#Heading]], or [[Note name]] with the sentence quoted so I can " +
+  "search for it. Never cite a line number - Obsidian does not show them, so " +
+  "I cannot find what you mean.\n\n---\n\n";
 
 export class ClaudePanel extends ItemView {
   plugin: ClaudeCodeSkillsPlugin;
@@ -30,6 +49,11 @@ export class ClaudePanel extends ItemView {
   private loadingEl: HTMLElement | null = null;
   private currentStreamPre: HTMLPreElement | null = null;
   private currentStreamContainer: HTMLElement | null = null;
+  private attachments: Attachment[] = [];
+  private attachTray!: HTMLElement;
+  private queue: string[] = [];
+  private focusBtn!: HTMLButtonElement;
+  private queueEl!: HTMLElement;
 
   constructor(leaf: WorkspaceLeaf, plugin: ClaudeCodeSkillsPlugin) {
     super(leaf);
@@ -58,11 +82,31 @@ export class ClaudePanel extends ItemView {
     this.skillLabelEl = sessionBar.createDiv({ cls: "claude-panel-skill-label" });
     this.skillLabelEl.setText("No active session");
 
+    // Focused mode: answer only from what was dragged in.
+    this.focusBtn = sessionBar.createEl("button", { cls: "claude-focus-toggle" });
+    this.focusBtn.addEventListener("click", () => {
+      this.plugin.settings.focusedMode = !this.plugin.settings.focusedMode;
+      void this.plugin.saveSettings();
+      this.updateFocusToggle();
+      new Notice(
+        this.plugin.settings.focusedMode
+          ? "Only what you drag in - no access to the vault"
+          : "Full access to the vault"
+      );
+      this.resetSession();   // the mode changes what the session can do
+    });
+    this.updateFocusToggle();
+
     // ── Messages area ────────────────────────────────────────────────────────
     this.messagesEl = contentEl.createDiv({ cls: "claude-panel-messages" });
 
     // ── Footer ───────────────────────────────────────────────────────────────
     const footer = contentEl.createDiv({ cls: "claude-panel-footer" });
+
+    // Attachment tray: whatever has been dragged in, waiting to be sent
+    this.attachTray = footer.createDiv({ cls: "claude-attach-tray" });
+    this.setupDropTarget(this.containerEl, contentEl);
+    this.renderAttachments();
 
     // Input row
     const inputRow = footer.createDiv({ cls: "claude-panel-input-row" });
@@ -76,13 +120,29 @@ export class ClaudePanel extends ItemView {
       text: "→",
     });
 
-    this.sendBtn.addEventListener("click", () => this.handleSend());
+    this.sendBtn.addEventListener("click", () => {
+      if (this.isStreaming) this.stopStreaming();
+      else this.handleSend();
+    });
     this.inputEl.addEventListener("keydown", (e: KeyboardEvent) => {
+      // While an IME is composing - pinyin, kana, any of them - Enter confirms
+      // the candidate and must not send. The flag is set by the browser for
+      // exactly this; keyCode 229 is the older spelling of it.
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         this.handleSend();
+        return;
+      }
+      if (e.key === "Escape" && this.isStreaming) {
+        e.preventDefault();
+        this.stopStreaming();
       }
     });
+
+    // How many messages are waiting behind the one being answered.
+    this.queueEl = footer.createDiv({ cls: "claude-queue-hint" });
+    this.updateQueueHint();
 
     // Action row
     const actionRow = footer.createDiv({ cls: "claude-panel-action-row" });
@@ -122,6 +182,8 @@ export class ClaudePanel extends ItemView {
   startConversation(skill: Skill, selectedText: string): void {
     if (!this.messagesEl) return; // onOpen not yet called
 
+    this.queue = [];
+    this.updateQueueHint();
     this.cancelFn?.(); // kill any in-progress stream
     this.isStreaming = false;
 
@@ -159,13 +221,228 @@ export class ClaudePanel extends ItemView {
 
   private handleSend(): void {
     const text = this.inputEl.value.trim();
-    if (!text || this.isStreaming) return;
+    const atts = this.attachments;
+    if (!text && !atts.length) return;
     this.inputEl.value = "";
-    this.addUserBubble(text);
-    this.send(null, text); // null skillId = follow-up / freeform
+    this.addUserMessage(text, atts);
+    this.attachments = [];
+    this.renderAttachments();
+
+    void this.composePayload(text, atts).then((payload) => {
+      if (this.isStreaming) {
+        this.queue.push(payload);
+        this.updateQueueHint();
+        return;
+      }
+      this.send(null, payload); // null skillId = follow-up / freeform
+    });
+  }
+
+  private updateFocusToggle(): void {
+    if (!this.focusBtn) return;
+    const on = this.plugin.settings.focusedMode;
+    this.focusBtn.setText(on ? "only what I drag in" : "whole vault");
+    this.focusBtn.toggleClass("is-focused", on);
+    this.focusBtn.setAttr(
+      "aria-label",
+      on
+        ? "Answers come only from what you drag in. Click for full vault access."
+        : "Claude may read and search the vault. Click to limit it to what you drag in."
+    );
+  }
+
+  /**
+   * In focused mode the CLI has no tools at all, so anything dragged in has to
+   * travel with the message: a dragged note is read here and inlined, rather
+   * than passed as a path for Claude to open.
+   */
+  private async composePayload(text: string, atts: Attachment[]): Promise<string> {
+    const question = text || "Explain what I attached.";
+    if (!this.plugin.settings.focusedMode) {
+      return attachmentsPreamble(atts) + question;
+    }
+
+    let out =
+      "Answer only from the material below. You have no access to my vault and " +
+      "no tools: this is everything you have. If the answer is not in it, say so " +
+      "plainly instead of guessing.\n\n";
+
+    for (let i = 0; i < atts.length; i++) {
+      const att = atts[i];
+      const n = i + 1;
+      if (att.kind === "text") {
+        out += `--- [${n}] selected in "${att.source}" ---\n\n${att.text}\n\n`;
+        continue;
+      }
+      const file = await this.readVaultText(att.path);
+      if (file) {
+        out += `--- [${n}] note: ${file.path} ---\n\n${file.content}\n\n`;
+      } else {
+        out += `--- [${n}] ${att.path} - not included: it is not a text file in ` +
+               `this vault, and in this mode I cannot open files for you ---\n\n`;
+      }
+    }
+
+    return out + "---\n\n" + question;
+  }
+
+  /** Reads a dragged file back out of the vault, if it is text. */
+  private async readVaultText(absPath: string): Promise<{ path: string; content: string } | null> {
+    try {
+      const adapter = this.app.vault.adapter as unknown as { basePath?: string };
+      const base = adapter.basePath ?? "";
+      if (!base || !absPath.startsWith(base + "/")) return null;
+      const rel = absPath.slice(base.length + 1);
+      const file = this.app.vault.getAbstractFileByPath(rel);
+      if (!(file instanceof TFile)) return null;
+      const readable = ["md", "txt", "csv", "json", "js", "ts", "py", "css", "html", "svg", "yml", "yaml"];
+      if (!readable.includes(file.extension)) return null;
+      return { path: rel, content: await this.app.vault.cachedRead(file) };
+    } catch {
+      return null;
+    }
+  }
+
+  // ── Dragged-in attachments ─────────────────────────────────────────────────
+
+  /**
+   * Accepts drops anywhere in the panel. The listeners are in the capture
+   * phase on the whole leaf, because the textarea would otherwise swallow
+   * dropped text before it ever reached us.
+   */
+  private setupDropTarget(rootEl: HTMLElement, paintEl: HTMLElement): void {
+    const stop = (e: DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    const over = (e: DragEvent) => {
+      stop(e);
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+      paintEl.addClass("claude-drop-active");
+    };
+
+    rootEl.addEventListener("dragenter", over, true);
+    rootEl.addEventListener("dragover", over, true);
+    rootEl.addEventListener("dragleave", (e: DragEvent) => {
+      if (!rootEl.contains(e.relatedTarget as Node)) paintEl.removeClass("claude-drop-active");
+    }, true);
+
+    rootEl.addEventListener("drop", (e: DragEvent) => {
+      stop(e);
+      paintEl.removeClass("claude-drop-active");
+      const dt = e.dataTransfer;
+      if (!dt) return;
+
+      // A file from Finder or the file explorer
+      if (dt.files && dt.files.length) {
+        Array.from(dt.files).forEach((f) => {
+          const p = (f as File & { path?: string }).path ?? f.name;
+          this.addAttachment({ kind: kindOf(p), label: p.split("/").pop() ?? p, path: p });
+        });
+        return;
+      }
+
+      const html = dt.getData("text/html") || "";
+      const uri = dt.getData("text/uri-list") || "";
+      const text = (dt.getData("text/plain") || "").replace(/\s+$/, "");
+
+      // An embed dragged out of a note: ![[some image.png]]
+      const link = text.trim().match(/^!?\[\[([^\]|]+)(\|[^\]]*)?\]\]$/);
+      if (link) {
+        const p = resolveVaultPath(this.app, link[1].trim());
+        if (p) {
+          this.addAttachment({ kind: kindOf(p), label: p.split("/").pop() ?? p, path: p });
+          return;
+        }
+      }
+
+      // A rendered image
+      const img = html.match(/<img[^>]+src="([^"]+)"/i);
+      const src = (img && img[1]) || uri;
+      if (src && !text.trim()) {
+        const p = resolveVaultPath(this.app, src);
+        if (p) {
+          this.addAttachment({ kind: kindOf(p), label: p.split("/").pop() ?? p, path: p });
+          return;
+        }
+      }
+
+      if (text.trim()) this.attachText(text);
+    }, true);
+  }
+
+  /** Attaches a passage of text. Called by the drop handler and from main.ts. */
+  attachText(text: string, sourceName?: string): void {
+    const source = sourceName ?? this.describeSource();
+    const first = text.split("\n").find((l) => l.trim()) ?? text;
+    const trimmed = first.trim();
+    this.addAttachment({
+      kind: "text",
+      label: trimmed.slice(0, 60) + (trimmed.length > 60 ? "…" : ""),
+      text,
+      source,
+    });
+  }
+
+  private describeSource(): string {
+    const f = this.app.workspace.getActiveFile();
+    return f ? f.basename : "note";
+  }
+
+  private addAttachment(att: Attachment): void {
+    if ("path" in att && this.attachments.some((x) => "path" in x && x.path === att.path)) return;
+    this.attachments.push(att);
+    this.renderAttachments();
+    this.inputEl?.focus();
+  }
+
+  private renderAttachments(): void {
+    if (!this.attachTray) return;
+    this.attachTray.empty();
+    const list = this.attachments;
+    this.attachTray.toggleClass("is-empty", list.length === 0);
+    if (!list.length) return;
+
+    const row = this.attachTray.createDiv({ cls: "claude-card-row" });
+    list.forEach((att, i) => {
+      buildCard(row, att, this.app, () => {
+        this.attachments.splice(i, 1);
+        this.renderAttachments();
+      });
+    });
+
+    const clear = this.attachTray.createEl("button", {
+      cls: "claude-attach-clear",
+      text: "clear " + list.length,
+    });
+    clear.addEventListener("click", () => {
+      this.attachments = [];
+      this.renderAttachments();
+    });
+  }
+
+  /** The sent message: attachment cards first, then what the user typed. */
+  private addUserMessage(text: string, atts: Attachment[]): void {
+    const div = this.messagesEl.createDiv({ cls: "claude-msg-user" });
+    div.createDiv({ cls: "claude-msg-label" }).setText("You");
+    const content = div.createDiv({ cls: "claude-msg-content" });
+
+    if (atts.length) {
+      const row = content.createDiv({ cls: "claude-card-row is-sent" });
+      atts.forEach((att) => buildCard(row, att, this.app, null));
+    }
+    if (text) content.createDiv({ cls: "claude-msg-text" }).setText(text);
+
+    const logged = atts
+      .map((att) => (att.kind === "text" ? `> ${att.label} (from ${att.source})` : `> ${att.path}`))
+      .join("\n");
+    this.conversationLog.push(`**You:** ${logged ? logged + "\n\n" : ""}${text}`);
+    this.scrollToBottom();
   }
 
   private send(skillId: string | null, text: string): void {
+    // First message of a session: say how to refer to places in the vault.
+    const body = this.sessionId ? text : CITING_PLACES + text;
     this.isStreaming = true;
     this.hasFirstChunk = false;
     this.updateInputState();
@@ -193,11 +470,11 @@ export class ClaudePanel extends ItemView {
 
     const cancel = runWithSkillStreaming(
       skillId,
-      text,
+      body,
       this.plugin.settings,
       this.sessionId,
       (chunk) => this.appendChunk(chunk),
-      (fullText, sid) => void this.finalize(fullText, sid),
+      (fullText, sid, stats) => void this.finalize(fullText, sid, stats),
       (err) => {
         this.isStreaming = false;
         this.cancelFn = null;
@@ -206,6 +483,7 @@ export class ClaudePanel extends ItemView {
         this.skillLabelEl.removeClass("is-streaming");
         this.skillLabelEl.setText(`${skillContext} · error`);
         this.updateInputState();
+        this.drainQueue();
         new Notice(`Claude error: ${err.message}`);
         if (this.currentStreamContainer) {
           this.currentStreamContainer.empty();
@@ -242,7 +520,11 @@ export class ClaudePanel extends ItemView {
     }
   }
 
-  private async finalize(fullText: string, sessionId: string | null): Promise<void> {
+  private async finalize(
+    fullText: string,
+    sessionId: string | null,
+    stats: TurnStats | null = null
+  ): Promise<void> {
     this.isStreaming = false;
     this.cancelFn = null;
 
@@ -278,6 +560,10 @@ export class ClaudePanel extends ItemView {
         renderedEl.empty();
         renderedEl.createEl("pre").setText(textToRender);
       });
+
+      this.openInternalLinksFrom(renderedEl);
+      this.addMessageActions(container, renderedEl, textToRender);
+      if (stats) this.showTurnCost(container, stats);
     }
 
     this.skillLabelEl.setText(
@@ -289,9 +575,33 @@ export class ClaudePanel extends ItemView {
     this.updateInputState();
     this.scrollToBottom();
     this.inputEl?.focus();
+    this.drainQueue();
   }
 
   // ── Close session ──────────────────────────────────────────────────────────
+
+  /**
+   * Starts a fresh CLI session while leaving the panel where it is. Changing
+   * the mode or the account invalidates the session, but neither is a reason
+   * to take the panel away.
+   */
+  resetSession(): void {
+    this.queue = [];
+    this.updateQueueHint();
+    this.cancelFn?.();
+    this.cancelFn = null;
+    this.sessionId = null;
+    this.isStreaming = false;
+    this.lastResponseText = "";
+    this.activeSkillName = null;
+    this.updateInputState();
+
+    if (this.messagesEl?.childElementCount) {
+      this.messagesEl.createEl("hr", { cls: "claude-panel-separator" });
+    }
+    this.skillLabelEl.setText("Chat");
+    this.scrollToBottom();
+  }
 
   closeSession(): void {
     this.cancelFn?.();
@@ -315,6 +625,65 @@ export class ClaudePanel extends ItemView {
     this.scrollToBottom();
   }
 
+  /**
+   * Per-message controls. "Copy" takes the whole answer as Markdown; "Source"
+   * swaps the rendered answer for its Markdown, so any part of it can be
+   * selected and copied with the syntax intact - which rendered HTML loses.
+   */
+  /** A [[wikilink]] in an answer opens the note, like one in a note would. */
+  private openInternalLinksFrom(el: HTMLElement): void {
+    el.addEventListener("click", (e: MouseEvent) => {
+      const a = (e.target as HTMLElement).closest("a.internal-link") as HTMLAnchorElement | null;
+      if (!a) return;
+      e.preventDefault();
+      const href = a.getAttr("data-href") ?? a.getAttribute("href") ?? "";
+      if (!href) return;
+      const newLeaf = e.metaKey || e.ctrlKey;
+      void this.app.workspace.openLinkText(href, "", newLeaf);
+    });
+  }
+
+  /** What this one answer cost, so the question never has to be guessed at. */
+  private showTurnCost(container: HTMLElement, stats: TurnStats): void {
+    const n = (v: number) => v.toLocaleString();
+    const parts = [
+      `${n(stats.inputTokens + stats.cacheReadTokens + stats.cacheWriteTokens)} in`,
+      `${n(stats.outputTokens)} out`,
+    ];
+    if (stats.cacheReadTokens) parts.push(`${n(stats.cacheReadTokens)} cached`);
+    if (stats.costUsd !== null) parts.push(`$${stats.costUsd.toFixed(4)}`);
+
+    container.createDiv({ cls: "claude-turn-cost" }).setText(parts.join("  ·  "));
+  }
+
+  private addMessageActions(container: HTMLElement, renderedEl: HTMLElement, raw: string): void {
+    const bar = container.createDiv({ cls: "claude-msg-actions" });
+
+    const copyBtn = bar.createEl("button", { text: "copy markdown" });
+    copyBtn.addEventListener("click", () => {
+      navigator.clipboard.writeText(raw)
+        .then(() => new Notice("Answer copied as Markdown"))
+        .catch(() => new Notice("Copy failed — check clipboard permissions"));
+    });
+
+    const srcBtn = bar.createEl("button", { text: "source" });
+    let pre: HTMLElement | null = null;
+    srcBtn.addEventListener("click", () => {
+      if (pre) {
+        pre.remove();
+        pre = null;
+        renderedEl.show();
+        srcBtn.setText("source");
+        return;
+      }
+      pre = container.createEl("pre", { cls: "claude-msg-source" });
+      pre.createEl("code").setText(raw);
+      container.insertBefore(pre, bar);
+      renderedEl.hide();
+      srcBtn.setText("rendered");
+    });
+  }
+
   private scrollToBottom(): void {
     if (this.messagesEl) {
       this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
@@ -323,9 +692,44 @@ export class ClaudePanel extends ItemView {
 
   private updateInputState(): void {
     if (!this.inputEl || !this.sendBtn) return;
-    this.inputEl.disabled = this.isStreaming;
-    this.sendBtn.disabled = this.isStreaming;
-    this.sendBtn.textContent = this.isStreaming ? "…" : "→";
+    // The box stays usable while an answer streams: the next message can be
+    // written, and sending it queues it behind the one in flight.
+    this.inputEl.disabled = false;
+    this.sendBtn.disabled = false;
+    this.sendBtn.textContent = this.isStreaming ? "\u25A0" : "\u2192";
+    this.sendBtn.toggleClass("is-stop", this.isStreaming);
+    this.sendBtn.setAttr("aria-label", this.isStreaming ? "Stop" : "Send");
+  }
+
+  /** Kills the subprocess and keeps whatever had already streamed. */
+  private stopStreaming(): void {
+    if (!this.isStreaming) return;
+    // Stop means stop: anything queued behind this answer is dropped too.
+    this.queue = [];
+    this.updateQueueHint();
+    this.cancelFn?.();
+    this.cancelFn = null;
+    this.isStreaming = false;
+
+    const partial = this.currentStreamPre?.textContent ?? "";
+    void this.finalize(partial, this.sessionId);
+    this.skillLabelEl.setText(`${this.activeSkillName ?? "Chat"} \u00b7 stopped`);
+    new Notice("Stopped");
+  }
+
+  private updateQueueHint(): void {
+    if (!this.queueEl) return;
+    const n = this.queue.length;
+    this.queueEl.toggleClass("is-empty", n === 0);
+    this.queueEl.setText(n === 0 ? "" : n === 1 ? "1 message waiting" : `${n} messages waiting`);
+  }
+
+  /** Sends the next queued message, once nothing is streaming. */
+  private drainQueue(): void {
+    if (this.isStreaming) return;
+    const next = this.queue.shift();
+    this.updateQueueHint();
+    if (next !== undefined) this.send(null, next);
   }
 
   private async createNote(): Promise<void> {

@@ -4,6 +4,15 @@ import * as path from "path";
 import * as os from "os";
 import type { PluginSettings } from "./types";
 
+/** What one answer cost, as the CLI reports it. */
+export interface TurnStats {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  costUsd: number | null;
+}
+
 // ── Path validation ────────────────────────────────────────────────────────────
 
 const VALID_BINARY_NAMES = ["claude", "claude-code", "claude.cmd"];
@@ -49,6 +58,30 @@ interface SpawnTarget {
  * On Windows, .cmd files cannot be spawned directly by Node — they require
  * shell: true. On all other platforms shell is not needed.
  */
+/**
+ * The config directory of the account in use, with ~ expanded. Empty when no
+ * accounts are configured, which leaves the CLI on its own default.
+ */
+export function resolveAccountDir(settings: PluginSettings): string {
+  const wanted = settings.activeAccount?.trim();
+  if (!wanted) return "";
+  for (const line of (settings.accounts ?? "").split("\n")) {
+    const [name, ...rest] = line.split("=");
+    if (!rest.length) continue;
+    if (name.trim() !== wanted) continue;
+    const dir = rest.join("=").trim();
+    return dir.startsWith("~") ? path.join(os.homedir(), dir.slice(1)) : dir;
+  }
+  return "";
+}
+
+export function accountNames(settings: PluginSettings): string[] {
+  return (settings.accounts ?? "")
+    .split("\n")
+    .map((line) => line.split("=")[0].trim())
+    .filter((name) => name.length > 0);
+}
+
 function buildSpawnTarget(claudeBin: string, claudeArgs: string[]): SpawnTarget {
   const shell = process.platform === "win32";
   return { command: claudeBin, args: claudeArgs, shell };
@@ -77,7 +110,7 @@ export function runWithSkillStreaming(
   settings: PluginSettings,
   sessionId: string | null,
   onChunk: (text: string) => void,
-  onDone: (fullText: string, sessionId: string | null) => void,
+  onDone: (fullText: string, sessionId: string | null, stats: TurnStats | null) => void,
   onError: (err: Error) => void
 ): () => void {
   try {
@@ -98,6 +131,12 @@ export function runWithSkillStreaming(
     "--verbose",
   ];
 
+  // Focused mode: the answer must come from what the user dragged in, so the
+  // CLI gets no tools - it cannot read the vault, search it, or run anything.
+  if (settings.focusedMode) {
+    claudeArgs.push("--tools", "");
+  }
+
   if (settings.maxBudgetUsd > 0) {
     claudeArgs.push("--max-budget-usd", String(settings.maxBudgetUsd));
   }
@@ -108,6 +147,7 @@ export function runWithSkillStreaming(
   }
 
   const { command, args, shell } = buildSpawnTarget(settings.claudeBinPath, claudeArgs);
+  const configDir = resolveAccountDir(settings);
 
   // Fall back to home directory if working directory is not configured
   const cwd = settings.workingDirectory.trim() || os.homedir();
@@ -115,7 +155,14 @@ export function runWithSkillStreaming(
   const proc = spawn(command, args, {
     cwd,
     shell,
-    env: { ...process.env, HOME: os.homedir(), CLAUDE_OBSIDIAN_PLUGIN: "1" },
+    env: {
+      ...process.env,
+      HOME: os.homedir(),
+      CLAUDE_OBSIDIAN_PLUGIN: "1",
+      // Each account has its own CLI config directory, which is where the
+      // login lives. Switching accounts is switching this.
+      ...(configDir ? { CLAUDE_CONFIG_DIR: configDir } : {}),
+    },
   });
 
   proc.stdin.write(message);
@@ -124,6 +171,7 @@ export function runWithSkillStreaming(
   let buffer = "";
   let finalResult = "";
   let capturedSessionId: string | null = null;
+  let stats: TurnStats | null = null;
   let killed = false;
 
   const timeoutId = activeWindow.setTimeout(() => {
@@ -167,13 +215,25 @@ export function runWithSkillStreaming(
         }
       }
 
-      // Final result — captures full text and session_id for --resume
+      // Final result — captures full text, session_id for --resume, and what
+      // the turn cost, which is the only honest way to answer "is this
+      // expensive?" for a given question.
       if (event.type === "result") {
         if (typeof event.result === "string") {
           finalResult = event.result;
         }
         if (typeof event.session_id === "string") {
           capturedSessionId = event.session_id;
+        }
+        const usage = event.usage as Record<string, number> | undefined;
+        if (usage || typeof event.total_cost_usd === "number") {
+          stats = {
+            inputTokens: usage?.input_tokens ?? 0,
+            outputTokens: usage?.output_tokens ?? 0,
+            cacheReadTokens: usage?.cache_read_input_tokens ?? 0,
+            cacheWriteTokens: usage?.cache_creation_input_tokens ?? 0,
+            costUsd: typeof event.total_cost_usd === "number" ? event.total_cost_usd : null,
+          };
         }
       }
     }
@@ -182,7 +242,7 @@ export function runWithSkillStreaming(
   proc.on("close", () => {
     activeWindow.clearTimeout(timeoutId);
     if (!killed) {
-      onDone(finalResult, capturedSessionId);
+      onDone(finalResult, capturedSessionId, stats);
     }
   });
 
