@@ -383,6 +383,18 @@ export class ClaudePanel extends ItemView {
         }
       }
 
+      // A note dragged from its tab header or from the file explorer arrives
+      // as an obsidian:// URL sitting in text/plain. Attaching that verbatim
+      // handed Claude a link and nothing else to read.
+      const asLink = (uri || text).trim();
+      if (!asLink.includes("\n") && /^(obsidian|app|file):\/\//.test(asLink)) {
+        const p = resolveVaultPath(this.app, asLink);
+        if (p) {
+          this.addAttachment({ kind: kindOf(p), label: p.split("/").pop() ?? p, path: p });
+          return;
+        }
+      }
+
       if (text.trim()) this.attachText(text);
     }, true);
   }

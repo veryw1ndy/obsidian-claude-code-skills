@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { Notice, Plugin } from "obsidian";
+import { MarkdownView, Notice, Plugin } from "obsidian";
 import { DEFAULT_SETTINGS, type PluginSettings, type Skill } from "./types";
 import { discoverSkills } from "./skillDiscovery";
 import { registerContextMenu } from "./contextMenu";
@@ -155,10 +155,76 @@ export default class ClaudeCodeSkillsPlugin extends Plugin {
     return f ? f.basename : "note";
   }
 
+  /**
+   * The selected text as the file has it, not as the screen has it.
+   *
+   * Obsidian virtualises live preview and reading view alike: lines scrolled
+   * out of the viewport are not in the DOM at all. So getSelection().toString()
+   * over a long selection returns only the blocks that happened to be rendered
+   * - a patchwork with holes where the gaps were, cut off wherever the viewport
+   * ended. Select a whole note, drag it in, and Claude receives a couple of
+   * screenfuls and reports, correctly, that the rest is not there.
+   *
+   * The editor's own getSelection() reads the document model, so it is always
+   * whole. Returns null when there is no editor behind the selection - reading
+   * view - and the caller should repair the text instead.
+   */
+  private selectedText(shown: string): string | null {
+    const editor =
+      this.app.workspace.getActiveViewOfType(MarkdownView)?.editor ??
+      this.app.workspace.activeEditor?.editor;
+    if (!editor) return null;
+    const exact = editor.getSelection();
+    if (!exact.trim()) return null;
+    // A selection made in reading view does not reach the editor, which then
+    // reports whatever the cursor last touched in the source. Only trust it
+    // when it actually covers what the screen showed.
+    return exact.length >= shown.length ? exact : null;
+  }
+
+  /**
+   * Puts back what reading view left out, by finding the fragment's first and
+   * last lines in the note on disk and taking everything between them.
+   * Markdown markup is ignored on both sides of the comparison, since the
+   * rendered text has none of it. Falls back to the fragment unchanged when
+   * either end cannot be placed.
+   */
+  private async repairFromFile(shown: string): Promise<string> {
+    const file = this.app.workspace.getActiveFile();
+    if (!file || file.extension !== "md") return shown;
+
+    const norm = (l: string) =>
+      l.replace(/^[>\s]*[-*+]?\s*/, "").replace(/^#+\s*/, "")
+        .replace(/[*_`~]|\[\[|\]\]/g, "")
+        .replace(/\s+/g, " ").trim().toLowerCase();
+
+    const fragment = shown.split("\n").map(norm).filter((l) => l.length > 8);
+    if (fragment.length < 2) return shown;
+
+    let content: string;
+    try {
+      content = await this.app.vault.cachedRead(file);
+    } catch {
+      return shown;
+    }
+    const lines = content.split("\n");
+    const normed = lines.map(norm);
+
+    const first = normed.indexOf(fragment[0]);
+    const last = normed.lastIndexOf(fragment[fragment.length - 1]);
+    if (first < 0 || last < first) return shown;
+
+    const span = lines.slice(first, last + 1).join("\n");
+    return span.length > shown.length ? span : shown;
+  }
+
   async attachSelectionToPanel(): Promise<void> {
     const active = this.app.workspace.activeEditor;
     let sel = active?.editor ? active.editor.getSelection() : "";
-    if (!sel.trim()) sel = activeWindow.getSelection()?.toString() ?? "";
+    if (!sel.trim()) {
+      const shown = activeWindow.getSelection()?.toString() ?? "";
+      sel = shown.trim() ? await this.repairFromFile(shown) : "";
+    }
     if (!sel.trim()) {
       new Notice("Select something first");
       return;
@@ -180,7 +246,9 @@ export default class ClaudeCodeSkillsPlugin extends Plugin {
    */
   private enableSelectionDrag(): void {
     const doc = activeDocument;
-    let pending: { x: number; y: number; text: string; source: string } | null = null;
+    let pending:
+      | { x: number; y: number; text: string; source: string; partial: boolean }
+      | null = null;
     let ghost: HTMLElement | null = null;
     let dragging = false;
 
@@ -228,8 +296,11 @@ export default class ClaudeCodeSkillsPlugin extends Plugin {
 
       const sel = doc.defaultView?.getSelection();
       if (!sel || sel.isCollapsed || !sel.rangeCount) return;
-      const text = sel.toString();
-      if (!text.trim()) return;
+      const shown = sel.toString();
+      if (!shown.trim()) return;
+      // What the DOM can give us is only what is on screen (see selectedText).
+      const exact = this.selectedText(shown);
+      const text = exact ?? shown;
 
       // Only when the press is actually on the selected text
       let hit = false;
@@ -246,7 +317,12 @@ export default class ClaudeCodeSkillsPlugin extends Plugin {
       }
       if (!hit) return;
 
-      pending = { x: e.clientX, y: e.clientY, text, source: this.sourceName() };
+      pending = {
+        x: e.clientX, y: e.clientY, text,
+        source: this.sourceName(),
+        // No editor behind it, so the text still needs repairing on drop.
+        partial: exact === null,
+      };
       e.preventDefault();
       e.stopPropagation();
     }, true);
@@ -276,9 +352,13 @@ export default class ClaudeCodeSkillsPlugin extends Plugin {
       cleanup();
 
       if (moved && onPanel) {
-        void this.openPanel().then((p) =>
-          p.attachText(held.text.replace(/\s+$/, ""), held.source)
-        );
+        void (async () => {
+          const text = held.partial
+            ? await this.repairFromFile(held.text)
+            : held.text;
+          const panel = await this.openPanel();
+          panel.attachText(text.replace(/\s+$/, ""), held.source);
+        })();
         return;
       }
       if (!moved) {

@@ -24,16 +24,31 @@ function vaultBase(app: App): string {
  */
 export function resolveVaultPath(app: App, src: string): string | null {
   try {
-    let s = decodeURIComponent(String(src).split("?")[0]).trim();
+    const raw = String(src).trim();
+    const base = vaultBase(app);
+
+    // obsidian://open?vault=Foo&file=Some%20Note - what a drag of a tab header
+    // or of a file out of the explorer actually carries. The note's name lives
+    // in the query string, which is the very part split("?")[0] throws away,
+    // so this used to resolve to the nonsense path "<vault>/obsidian://open".
+    if (raw.startsWith("obsidian://")) {
+      const name = new URL(raw).searchParams.get("file");
+      if (!name) return null;
+      const dest = app.metadataCache.getFirstLinkpathDest(name, "");
+      return dest ? base + "/" + dest.path : null;
+    }
+
+    let s = decodeURIComponent(raw.split("?")[0]);
     if (s.startsWith("app://local")) s = s.slice("app://local".length);
     else if (s.startsWith("file://")) s = s.slice("file://".length);
     if (s.startsWith("/")) return s;
 
-    const base = vaultBase(app);
     const active = app.workspace.getActiveFile();
     const dest = app.metadataCache.getFirstLinkpathDest(s, active ? active.path : "");
     if (dest) return base + "/" + dest.path;
-    return base ? base + "/" + s : null;
+    // Only when it really is something in the vault. Guessing a path produced
+    // a card that could never be read, and an answer that said so.
+    return base && app.vault.getAbstractFileByPath(s) ? base + "/" + s : null;
   } catch {
     return null;
   }
