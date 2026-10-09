@@ -30,6 +30,9 @@ const CITING_PLACES =
   "search for it. Never cite a line number - Obsidian does not show them, so " +
   "I cannot find what you mean.\n\n---\n\n";
 
+/** How close to the bottom still counts as "following along", in pixels. */
+const STICK_THRESHOLD_PX = 40;
+
 export class ClaudePanel extends ItemView {
   plugin: ClaudeCodeSkillsPlugin;
 
@@ -40,6 +43,9 @@ export class ClaudePanel extends ItemView {
   private conversationLog: string[] = []; // full transcript for Create Note
   private activeSkillName: string | null = null;
   private hasFirstChunk = false;
+  // False once the reader has scrolled up: streaming text must not drag
+  // the view back down while they are reading something further up.
+  private stickToBottom = true;
 
   // DOM refs
   private messagesEl!: HTMLElement;
@@ -99,6 +105,16 @@ export class ClaudePanel extends ItemView {
 
     // ── Messages area ────────────────────────────────────────────────────────
     this.messagesEl = contentEl.createDiv({ cls: "claude-panel-messages" });
+
+    // Any scroll that leaves the bottom hands control to the reader; scrolling
+    // back to the bottom takes it back, so following along needs no button.
+    this.registerDomEvent(this.messagesEl, "scroll", () => {
+      const distance =
+        this.messagesEl.scrollHeight -
+        this.messagesEl.scrollTop -
+        this.messagesEl.clientHeight;
+      this.stickToBottom = distance <= STICK_THRESHOLD_PX;
+    });
 
     // ── Footer ───────────────────────────────────────────────────────────────
     const footer = contentEl.createDiv({ cls: "claude-panel-footer" });
@@ -437,7 +453,7 @@ export class ClaudePanel extends ItemView {
       .map((att) => (att.kind === "text" ? `> ${att.label} (from ${att.source})` : `> ${att.path}`))
       .join("\n");
     this.conversationLog.push(`**You:** ${logged ? logged + "\n\n" : ""}${text}`);
-    this.scrollToBottom();
+    this.scrollToBottom(true);
   }
 
   private send(skillId: string | null, text: string): void {
@@ -466,7 +482,7 @@ export class ClaudePanel extends ItemView {
     // currentStreamPre is created lazily on the first chunk (see appendChunk)
     this.currentStreamPre = null;
 
-    this.scrollToBottom();
+    this.scrollToBottom(true);
 
     const cancel = runWithSkillStreaming(
       skillId,
@@ -600,7 +616,7 @@ export class ClaudePanel extends ItemView {
       this.messagesEl.createEl("hr", { cls: "claude-panel-separator" });
     }
     this.skillLabelEl.setText("Chat");
-    this.scrollToBottom();
+    this.scrollToBottom(true);
   }
 
   closeSession(): void {
@@ -622,7 +638,7 @@ export class ClaudePanel extends ItemView {
     div.createDiv({ cls: "claude-msg-label" }).setText("You");
     div.createDiv({ cls: "claude-msg-content" }).setText(text);
     this.conversationLog.push(`**You:** ${text}`);
-    this.scrollToBottom();
+    this.scrollToBottom(true);
   }
 
   /**
@@ -684,10 +700,16 @@ export class ClaudePanel extends ItemView {
     });
   }
 
-  private scrollToBottom(): void {
-    if (this.messagesEl) {
-      this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
-    }
+  /**
+   * @param force  Scroll even if the reader has scrolled up. Only for things
+   *               they just did themselves — sending a message, starting a
+   *               new session — never for text arriving on its own.
+   */
+  private scrollToBottom(force = false): void {
+    if (!this.messagesEl) return;
+    if (!force && !this.stickToBottom) return;
+    this.stickToBottom = true;
+    this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
   }
 
   private updateInputState(): void {
