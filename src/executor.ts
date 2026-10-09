@@ -70,9 +70,19 @@ export function resolveAccountDir(settings: PluginSettings): string {
     if (!rest.length) continue;
     if (name.trim() !== wanted) continue;
     const dir = rest.join("=").trim();
-    return dir.startsWith("~") ? path.join(os.homedir(), dir.slice(1)) : dir;
+    const expanded = dir.startsWith("~") ? path.join(os.homedir(), dir.slice(1)) : dir;
+    // Setting CLAUDE_CONFIG_DIR at all moves the CLI to a per-directory
+    // credential bucket, so pointing it at the default directory hides the
+    // ordinary `claude /login` and the panel reports "Not logged in". An
+    // account on the default directory must leave the variable unset.
+    return expanded === defaultConfigDir() ? "" : expanded;
   }
   return "";
+}
+
+/** Where the CLI keeps its config when CLAUDE_CONFIG_DIR is not set. */
+function defaultConfigDir(): string {
+  return path.join(os.homedir(), ".claude");
 }
 
 export function accountNames(settings: PluginSettings): string[] {
@@ -129,6 +139,11 @@ export function runWithSkillStreaming(
     "--output-format", "stream-json",
     "--include-partial-messages",
     "--verbose",
+    // Every configured MCP server ships its full tool schema on every turn,
+    // used or not. The servers in the CLI's user scope belong to other work
+    // and cost ~25k input tokens a turn here, so the panel loads none of
+    // them. Drop this flag to get them back.
+    "--strict-mcp-config",
   ];
 
   // Focused mode: the answer must come from what the user dragged in, so the
@@ -173,16 +188,36 @@ export function runWithSkillStreaming(
   let capturedSessionId: string | null = null;
   let stats: TurnStats | null = null;
   let killed = false;
+  let errorSubtype = "";
+  let stderrText = "";
 
-  const timeoutId = activeWindow.setTimeout(() => {
-    if (!killed) {
-      killed = true;
-      proc.kill();
-      onError(new Error(`Claude timed out after ${settings.timeout / 1000}s`));
+  // The timeout is idle time, not total time. A long answer streams deltas
+  // the whole way through, and a long tool call still emits events, so the
+  // clock only runs out when the CLI has genuinely gone quiet. Measuring
+  // total time instead killed perfectly healthy turns at two minutes.
+  let timeoutId = 0;
+  const stopTimer = () => {
+    if (timeoutId) {
+      activeWindow.clearTimeout(timeoutId);
+      timeoutId = 0;
     }
-  }, settings.timeout);
+  };
+  const resetTimer = () => {
+    stopTimer();
+    timeoutId = activeWindow.setTimeout(() => {
+      if (!killed) {
+        killed = true;
+        proc.kill();
+        onError(
+          new Error(`Claude went quiet for ${settings.timeout / 1000}s — stopped.`),
+        );
+      }
+    }, settings.timeout);
+  };
+  resetTimer();
 
   proc.stdout.on("data", (rawChunk: Buffer) => {
+    resetTimer();
     buffer += rawChunk.toString("utf8");
     const lines = buffer.split("\n");
     buffer = lines.pop() ?? "";
@@ -222,6 +257,12 @@ export function runWithSkillStreaming(
         if (typeof event.result === "string") {
           finalResult = event.result;
         }
+        // A failed turn carries no result text at all, so without this the
+        // panel would just show the cost line and nothing else. The budget
+        // cap is the usual culprit: it stops the run mid tool call.
+        if (event.is_error === true && typeof event.subtype === "string") {
+          errorSubtype = event.subtype;
+        }
         if (typeof event.session_id === "string") {
           capturedSessionId = event.session_id;
         }
@@ -239,15 +280,27 @@ export function runWithSkillStreaming(
     }
   });
 
+  proc.stderr.on("data", (rawChunk: Buffer) => {
+    resetTimer();
+    stderrText += rawChunk.toString("utf8");
+  });
+
   proc.on("close", () => {
-    activeWindow.clearTimeout(timeoutId);
-    if (!killed) {
-      onDone(finalResult, capturedSessionId, stats);
+    stopTimer();
+    if (killed) return;
+    if (!finalResult && errorSubtype) {
+      onError(new Error(describeFailure(errorSubtype, settings)));
+      return;
     }
+    if (!finalResult && stderrText.trim()) {
+      onError(new Error(stderrText.trim().split("\n")[0]));
+      return;
+    }
+    onDone(finalResult, capturedSessionId, stats);
   });
 
   proc.on("error", (err: Error) => {
-    activeWindow.clearTimeout(timeoutId);
+    stopTimer();
     if (!killed) {
       killed = true;
       onError(err);
@@ -257,8 +310,23 @@ export function runWithSkillStreaming(
   return () => {
     if (!killed) {
       killed = true;
-      activeWindow.clearTimeout(timeoutId);
+      stopTimer();
       proc.kill();
     }
   };
+}
+
+/** Turn a CLI failure subtype into something that says what to change. */
+function describeFailure(subtype: string, settings: PluginSettings): string {
+  if (subtype === "error_max_budget_usd") {
+    return (
+      `Stopped: the turn hit the $${settings.maxBudgetUsd} budget cap before Claude ` +
+      "finished, so nothing was written. Raise \"Max budget\" in the plugin " +
+      "settings, or set it to 0 to remove the cap."
+    );
+  }
+  if (subtype === "error_max_turns") {
+    return "Stopped: Claude hit the maximum number of turns before finishing.";
+  }
+  return `Claude ended with an error (${subtype}).`;
 }

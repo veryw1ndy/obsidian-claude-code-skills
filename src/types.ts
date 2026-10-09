@@ -10,7 +10,7 @@ export interface PluginSettings {
   accounts: string;         // one "name = /path/to/config-dir" per line
   activeAccount: string;    // the name currently in use; empty = the CLI default
   focusedMode: boolean;     // answer only from what was dragged in, with no tools
-  timeout: number;          // ms before killing subprocess
+  timeout: number;          // ms of silence before killing subprocess
   maxBudgetUsd: number;     // per-query API spend cap in USD (0 = no cap)
   outputFolder: string;     // vault-relative folder for created notes (empty = vault root)
   enabledSkills: string[];  // skill IDs that appear in the context menu (empty = all enabled)

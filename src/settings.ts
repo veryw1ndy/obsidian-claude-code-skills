@@ -52,7 +52,8 @@ export class ClaudeSkillsSettingTab extends PluginSettingTab {
         'One per line, as "name = /path/to/config/dir". Each directory holds its own ' +
         "login, so a second account means a second directory: run " +
         "CLAUDE_CONFIG_DIR=~/.claude-second claude in a terminal and log in there " +
-        "once. Leave empty to use the CLI's default."
+        "once. ~/.claude is the CLI's own default and uses your ordinary " +
+        "claude /login. Leave empty to use that default."
       )
       .addTextArea((text) =>
         text
@@ -78,9 +79,9 @@ export class ClaudeSkillsSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("Timeout (ms)")
+      .setName("Silence timeout (ms)")
       .setDesc(
-        "Maximum milliseconds to wait for a response before killing the subprocess."
+        "How long Claude may go without sending anything before the subprocess is killed. A long answer keeps streaming, so this only fires when the CLI has gone quiet."
       )
       .addText((text) =>
         text
