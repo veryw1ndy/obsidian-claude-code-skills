@@ -63,7 +63,12 @@ interface SpawnTarget {
  * accounts are configured, which leaves the CLI on its own default.
  */
 export function resolveAccountDir(settings: PluginSettings): string {
-  const wanted = settings.activeAccount?.trim();
+  return accountDir(settings, settings.activeAccount);
+}
+
+/** The config directory of any one account, by name. */
+export function accountDir(settings: PluginSettings, name: string | undefined): string {
+  const wanted = name?.trim();
   if (!wanted) return "";
   for (const line of (settings.accounts ?? "").split("\n")) {
     const [name, ...rest] = line.split("=");
@@ -83,6 +88,32 @@ export function resolveAccountDir(settings: PluginSettings): string {
 /** Where the CLI keeps its config when CLAUDE_CONFIG_DIR is not set. */
 function defaultConfigDir(): string {
   return path.join(os.homedir(), ".claude");
+}
+
+/**
+ * The environment every CLI call runs with. Each account has its own CLI
+ * config directory, which is where the login lives, so switching accounts is
+ * switching CLAUDE_CONFIG_DIR.
+ */
+export function cliEnv(configDir: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    HOME: os.homedir(),
+    CLAUDE_OBSIDIAN_PLUGIN: "1",
+    ...(configDir ? { CLAUDE_CONFIG_DIR: configDir } : {}),
+  };
+}
+
+/**
+ * A turn that failed because of the account, not the question: not logged in,
+ * or out of usage. The CLI reports both as an ordinary-looking answer, so
+ * without this the panel would show "Not logged in · Please run /login" as if
+ * Claude had said it, with no way to act on it.
+ */
+export class AccountProblem extends Error {
+  constructor(readonly kind: "auth" | "rate_limit", message: string) {
+    super(message);
+  }
 }
 
 export function accountNames(settings: PluginSettings): string[] {
@@ -167,18 +198,7 @@ export function runWithSkillStreaming(
   // Fall back to home directory if working directory is not configured
   const cwd = settings.workingDirectory.trim() || os.homedir();
 
-  const proc = spawn(command, args, {
-    cwd,
-    shell,
-    env: {
-      ...process.env,
-      HOME: os.homedir(),
-      CLAUDE_OBSIDIAN_PLUGIN: "1",
-      // Each account has its own CLI config directory, which is where the
-      // login lives. Switching accounts is switching this.
-      ...(configDir ? { CLAUDE_CONFIG_DIR: configDir } : {}),
-    },
-  });
+  const proc = spawn(command, args, { cwd, shell, env: cliEnv(configDir) });
 
   proc.stdin.write(message);
   proc.stdin.end();
@@ -190,6 +210,8 @@ export function runWithSkillStreaming(
   let killed = false;
   let errorSubtype = "";
   let stderrText = "";
+  let accountError = "";
+  let resultIsError = false;
 
   // The timeout is idle time, not total time. A long answer streams deltas
   // the whole way through, and a long tool call still emits events, so the
@@ -250,6 +272,13 @@ export function runWithSkillStreaming(
         }
       }
 
+      // The only place a login or usage failure is marked as one: the
+      // synthetic assistant message carries "authentication_failed" or
+      // "rate_limit", while the result just reads like an answer.
+      if (event.type === "assistant" && typeof event.error === "string") {
+        accountError = event.error;
+      }
+
       // Final result — captures full text, session_id for --resume, and what
       // the turn cost, which is the only honest way to answer "is this
       // expensive?" for a given question.
@@ -260,6 +289,7 @@ export function runWithSkillStreaming(
         // A failed turn carries no result text at all, so without this the
         // panel would just show the cost line and nothing else. The budget
         // cap is the usual culprit: it stops the run mid tool call.
+        if (event.is_error === true) resultIsError = true;
         if (event.is_error === true && typeof event.subtype === "string") {
           errorSubtype = event.subtype;
         }
@@ -288,6 +318,13 @@ export function runWithSkillStreaming(
   proc.on("close", () => {
     stopTimer();
     if (killed) return;
+    if (resultIsError && (accountError === "authentication_failed" || accountError === "rate_limit")) {
+      onError(new AccountProblem(
+        accountError === "rate_limit" ? "rate_limit" : "auth",
+        finalResult || (accountError === "rate_limit" ? "Out of usage" : "Not logged in"),
+      ));
+      return;
+    }
     if (!finalResult && errorSubtype) {
       onError(new Error(describeFailure(errorSubtype, settings)));
       return;

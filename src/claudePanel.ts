@@ -1,5 +1,6 @@
 import {
   ItemView,
+  Menu,
   TFile,
   MarkdownRenderer,
   Notice,
@@ -8,7 +9,14 @@ import {
 } from "obsidian";
 import type ClaudeCodeSkillsPlugin from "./main";
 import type { Skill } from "./types";
-import { runWithSkillStreaming, type TurnStats } from "./executor";
+import {
+  AccountProblem,
+  accountNames,
+  resolveAccountDir,
+  runWithSkillStreaming,
+  type TurnStats,
+} from "./executor";
+import { readAuthStatus } from "./auth";
 import {
   type Attachment,
   attachmentsPreamble,
@@ -59,6 +67,8 @@ export class ClaudePanel extends ItemView {
   private attachTray!: HTMLElement;
   private queue: string[] = [];
   private focusBtn!: HTMLButtonElement;
+  private accountBtn!: HTMLButtonElement;
+  private accountCheck = 0; // newest status read wins
   private queueEl!: HTMLElement;
 
   constructor(leaf: WorkspaceLeaf, plugin: ClaudeCodeSkillsPlugin) {
@@ -87,6 +97,12 @@ export class ClaudePanel extends ItemView {
     const sessionBar = contentEl.createDiv({ cls: "claude-panel-session-bar" });
     this.skillLabelEl = sessionBar.createDiv({ cls: "claude-panel-skill-label" });
     this.skillLabelEl.setText("No active session");
+
+    // Which account answers, and whether it is logged in. A click offers the
+    // other accounts and the login window.
+    this.accountBtn = sessionBar.createEl("button", { cls: "claude-account-chip" });
+    this.accountBtn.addEventListener("click", (e: MouseEvent) => this.showAccountMenu(e));
+    this.updateAccountChip();
 
     // Focused mode: answer only from what was dragged in.
     this.focusBtn = sessionBar.createEl("button", { cls: "claude-focus-toggle" });
@@ -511,6 +527,19 @@ export class ClaudePanel extends ItemView {
         this.skillLabelEl.removeClass("is-streaming");
         this.skillLabelEl.setText(`${skillContext} · error`);
         this.updateInputState();
+        if (err instanceof AccountProblem) {
+          // Anything queued would fail the same way, so it waits for the
+          // retry, which drains it once an answer comes back.
+          if (this.currentStreamContainer) {
+            this.currentStreamContainer.empty();
+            this.showAccountProblem(this.currentStreamContainer, err, () => this.send(skillId, text));
+          }
+          if (err.kind === "auth") this.updateAccountChip();
+          this.currentStreamPre = null;
+          this.currentStreamContainer = null;
+          this.scrollToBottom();
+          return;
+        }
         this.drainQueue();
         new Notice(`Claude error: ${err.message}`);
         if (this.currentStreamContainer) {
@@ -606,6 +635,89 @@ export class ClaudePanel extends ItemView {
     this.drainQueue();
   }
 
+  // ── Accounts ───────────────────────────────────────────────────────────────
+
+  /** Shows the active account, marked when it is not logged in. */
+  updateAccountChip(): void {
+    if (!this.accountBtn) return;
+    const settings = this.plugin.settings;
+    const name = settings.activeAccount || "account";
+    this.accountBtn.setText(name);
+    this.accountBtn.removeClass("is-logged-out");
+    this.accountBtn.setAttr("aria-label", `Claude account: ${name}`);
+
+    const check = ++this.accountCheck;
+    readAuthStatus(settings, resolveAccountDir(settings))
+      .then((st) => {
+        if (check !== this.accountCheck) return;
+        this.accountBtn.toggleClass("is-logged-out", !st.loggedIn);
+        this.accountBtn.setText(st.loggedIn ? name : `${name} · log in`);
+        this.accountBtn.setAttr(
+          "aria-label",
+          st.loggedIn
+            ? `Claude account: ${name}${st.email ? ` (${st.email})` : ""}`
+            : `${name} is not logged in. Click to log in.`
+        );
+      })
+      .catch(() => { /* no CLI to ask: sending will say so */ });
+  }
+
+  private showAccountMenu(e: MouseEvent): void {
+    const settings = this.plugin.settings;
+    const active = settings.activeAccount;
+    const menu = new Menu();
+    for (const name of accountNames(settings)) {
+      menu.addItem((item) =>
+        item
+          .setTitle(name)
+          .setChecked(name === active)
+          .onClick(() => {
+            if (name !== active) void this.plugin.setAccount(name);
+          })
+      );
+    }
+    if (accountNames(settings).length) menu.addSeparator();
+    menu.addItem((item) =>
+      item
+        .setTitle(active ? `Log in to ${active}…` : "Log in…")
+        .setIcon("log-in")
+        .onClick(() => this.plugin.openLogin(active))
+    );
+    menu.showAtMouseEvent(e);
+  }
+
+  /**
+   * In place of the answer: what went wrong with the account, and buttons that
+   * fix it. Either fix sends the message again, so nothing has to be retyped.
+   */
+  private showAccountProblem(container: HTMLElement, err: AccountProblem, retry: () => void): void {
+    const settings = this.plugin.settings;
+    const active = settings.activeAccount;
+    const box = container.createDiv({ cls: "claude-account-problem" });
+
+    box.createDiv({
+      cls: "claude-account-problem-text",
+      text:
+        err.kind === "auth"
+          ? `${active ? `"${active}" is` : "Claude is"} not logged in.`
+          : `${err.message}${active ? ` (account "${active}")` : ""}`,
+    });
+
+    const row = box.createDiv({ cls: "claude-account-problem-actions" });
+    if (err.kind === "auth") {
+      row.createEl("button", { text: "Log in", cls: "mod-cta" })
+        .addEventListener("click", () => this.plugin.openLogin(active, retry));
+    }
+    for (const name of accountNames(settings)) {
+      if (name === active) continue;
+      row.createEl("button", { text: `Use ${name}` }).addEventListener("click", () => {
+        void this.plugin.setAccount(name).then(retry);
+      });
+    }
+
+    this.conversationLog.push(`**Claude:** _${err.message}_`);
+  }
+
   // ── Close session ──────────────────────────────────────────────────────────
 
   /**
@@ -628,6 +740,7 @@ export class ClaudePanel extends ItemView {
       this.messagesEl.createEl("hr", { cls: "claude-panel-separator" });
     }
     this.skillLabelEl.setText("Chat");
+    this.updateAccountChip();
     this.scrollToBottom(true);
   }
 

@@ -1,5 +1,6 @@
-import { App, Notice, PluginSettingTab, Setting } from "obsidian";
-import { accountNames } from "./executor";
+import { App, PluginSettingTab, Setting } from "obsidian";
+import { accountDir, accountNames } from "./executor";
+import { readAuthStatus } from "./auth";
 import type ClaudeCodeSkillsPlugin from "./main";
 
 export class ClaudeSkillsSettingTab extends PluginSettingTab {
@@ -50,10 +51,9 @@ export class ClaudeSkillsSettingTab extends PluginSettingTab {
       .setName("Accounts")
       .setDesc(
         'One per line, as "name = /path/to/config/dir". Each directory holds its own ' +
-        "login, so a second account means a second directory: run " +
-        "CLAUDE_CONFIG_DIR=~/.claude-second claude in a terminal and log in there " +
-        "once. ~/.claude is the CLI's own default and uses your ordinary " +
-        "claude /login. Leave empty to use that default."
+        "login, so a second account means a second directory - any new path will " +
+        "do, and Log in below creates it. ~/.claude is the CLI's own default. " +
+        "Leave empty to use that default."
       )
       .addTextArea((text) =>
         text
@@ -65,6 +65,8 @@ export class ClaudeSkillsSettingTab extends PluginSettingTab {
           })
       );
 
+    this.showLogins(containerEl);
+
     new Setting(containerEl)
       .setName("Active account")
       .setDesc("Which one to use. Switch here when an account runs out of usage.")
@@ -72,9 +74,7 @@ export class ClaudeSkillsSettingTab extends PluginSettingTab {
         drop.addOption("", "CLI default");
         for (const name of accountNames(this.plugin.settings)) drop.addOption(name, name);
         drop.setValue(this.plugin.settings.activeAccount).onChange((value) => {
-          this.plugin.settings.activeAccount = value;
-          void this.plugin.saveSettings();
-          new Notice(value ? `Claude account: ${value}` : "Claude account: CLI default");
+          void this.plugin.setAccount(value);
         });
       });
 
@@ -176,6 +176,36 @@ export class ClaudeSkillsSettingTab extends PluginSettingTab {
             })
           );
       }
+    }
+  }
+
+  /**
+   * One row per account: who it is logged in as, and a button to log in.
+   * Rows are filled in as the CLI answers, so the page opens at once.
+   */
+  private showLogins(containerEl: HTMLElement): void {
+    const settings = this.plugin.settings;
+    const names = accountNames(settings);
+    const rows = names.length ? names : [""];
+
+    for (const name of rows) {
+      const row = new Setting(containerEl)
+        .setName(name ? `Login: ${name}` : "Login")
+        .setDesc("Checking…");
+      row.addButton((btn) =>
+        btn.setButtonText("Log in").onClick(() =>
+          this.plugin.openLogin(name, () => this.display())
+        )
+      );
+      readAuthStatus(settings, accountDir(settings, name))
+        .then((st) => {
+          row.setDesc(
+            st.loggedIn
+              ? `Logged in${st.email ? ` as ${st.email}` : ""}.`
+              : "Not logged in."
+          );
+        })
+        .catch(() => row.setDesc("Could not ask the CLI - check the binary path above."));
     }
   }
 }

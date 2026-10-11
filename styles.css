@@ -520,3 +520,96 @@
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
 }
+
+/* ── Accounts and login ─────────────────────────────────────────────────── */
+
+.claude-account-chip {
+  background: none;
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: none;
+  border-radius: 10px;
+  padding: 1px 8px;
+  height: auto;
+  font-size: 10px;
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.claude-account-chip:hover { color: var(--text-normal); }
+
+.claude-account-chip.is-logged-out {
+  color: var(--text-on-accent);
+  background: var(--color-red);
+  border-color: var(--color-red);
+}
+
+.claude-account-problem {
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--color-orange);
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: var(--background-secondary);
+}
+
+.claude-account-problem-text {
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+.claude-account-problem-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.claude-login-modal .claude-login-status {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.claude-login-modal .claude-login-status.is-ok { color: var(--color-green); }
+.claude-login-modal .claude-login-status.is-error { color: var(--text-error); }
+
+.claude-login-modal .claude-login-steps {
+  margin: 0 0 12px;
+  padding-left: 20px;
+}
+
+.claude-login-modal .claude-login-steps li { margin-bottom: 4px; }
+
+.claude-login-modal .claude-login-other {
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 10px;
+}
+
+.claude-login-modal .claude-login-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.claude-login-modal .claude-login-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.claude-login-modal .claude-login-row.is-footer {
+  justify-content: flex-end;
+  margin-top: 12px;
+  margin-bottom: 0;
+}
+
+.claude-login-modal .claude-login-code {
+  flex: 1 1 200px;
+  min-width: 0;
+  font-family: var(--font-monospace);
+}
+
+.claude-login-modal .claude-login-warning {
+  font-size: 13px;
+  color: var(--text-warning);
+  margin-top: 4px;
+}

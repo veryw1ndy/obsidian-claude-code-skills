@@ -8,6 +8,7 @@ import { registerContextMenu } from "./contextMenu";
 import { accountNames } from "./executor";
 import { ClaudePanel, CLAUDE_PANEL_VIEW_TYPE } from "./claudePanel";
 import { ClaudeSkillsSettingTab } from "./settings";
+import { LoginModal } from "./loginModal";
 
 // ── Binary auto-detection ──────────────────────────────────────────────────────
 
@@ -125,6 +126,12 @@ export default class ClaudeCodeSkillsPlugin extends Plugin {
       callback: () => void this.cycleAccount(),
     });
 
+    this.addCommand({
+      id: "log-in-claude-account",
+      name: "Log in to Claude",
+      callback: () => this.openLogin(this.settings.activeAccount),
+    });
+
     this.enableSelectionDrag();
     this.addSettingTab(new ClaudeSkillsSettingTab(this.app, this));
   }
@@ -140,14 +147,30 @@ export default class ClaudeCodeSkillsPlugin extends Plugin {
       return;
     }
     const at = names.indexOf(this.settings.activeAccount);
-    const next = names[(at + 1) % names.length];
-    this.settings.activeAccount = next;
-    await this.saveSettings();
-    new Notice(`Claude account: ${next}`);
+    await this.setAccount(names[(at + 1) % names.length]);
+  }
 
+  async setAccount(name: string): Promise<void> {
+    this.settings.activeAccount = name;
+    await this.saveSettings();
+    new Notice(name ? `Claude account: ${name}` : "Claude account: CLI default");
     // The session belongs to the old account, so start a fresh one.
+    this.panel()?.resetSession();
+  }
+
+  /** Opens the login window for one account; `after` runs once it succeeds. */
+  openLogin(account: string, after?: () => void): void {
+    new LoginModal(this.app, this, account, after).open();
+  }
+
+  /** Re-reads the login state shown on the panel's account button. */
+  refreshAccountChip(): void {
+    this.panel()?.updateAccountChip();
+  }
+
+  private panel(): ClaudePanel | null {
     const leaves = this.app.workspace.getLeavesOfType(CLAUDE_PANEL_VIEW_TYPE);
-    if (leaves.length) (leaves[0].view as unknown as ClaudePanel).resetSession();
+    return leaves.length ? (leaves[0].view as unknown as ClaudePanel) : null;
   }
 
   private sourceName(): string {
